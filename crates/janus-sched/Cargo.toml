@@ -1,0 +1,23 @@
+[package]
+name = "janus-sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+janus-core = { path = "../janus-core" }
+janus-kinetic = { path = "../janus-kinetic" }
+# dtact: in-house M:N topology-aware fiber runtime (ENGINEERING_SPEC.md §7).
+# Path dependency to the sibling `janus-dev/dtact` checkout per the task
+# instructions. NOTE: this path is OUTSIDE this workspace's directory tree
+# (it lives at D:\dev\janus-dev\dtact, i.e. a sibling of D:\dev\janus, not a
+# subdirectory of it) — Cargo path dependencies do not require the dependency
+# to be inside the workspace root, only that the path resolves, so this is a
+# valid Cargo manifest even though `dtact` is not itself a member of this
+# [workspace]'s `members` list.
+dtact = { path = "../../../janus-dev/dtact" }
+
+# NOTE: janus-sched depends on janus-kinetic (the solver) and dtact
+# (scheduling), never the reverse (ENGINEERING_SPEC.md §3 hard rule: the
+# solver must never depend on UI/scheduling-adjacent crates it doesn't need).
+# janus-sched itself also must never depend on janus-ui/janus-viz.

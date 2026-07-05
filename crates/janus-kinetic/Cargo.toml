@@ -1,0 +1,10 @@
+[package]
+name = "janus-kinetic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+janus-core = { path = "../janus-core" }
+# NOTE: no iced/wgpu/dtact dependency — janus-kinetic must never depend on
+# UI/viz crates (ENGINEERING_SPEC.md §3, hard rule).

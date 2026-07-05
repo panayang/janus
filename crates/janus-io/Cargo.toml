@@ -1,0 +1,12 @@
+[package]
+name = "janus-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+janus-core = { path = "../janus-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }

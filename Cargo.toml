@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/janus-core",
+    "crates/janus-io",
+    "crates/janus-kinetic",
+    "crates/janus-cli",
+    "crates/janus-sched",
+]
+# NOTE: janus-viz / janus-ui are M3 scope and are intentionally NOT added as
+# workspace members yet (empty placeholder dirs may exist under crates/ for
+# future use, but an empty crate with no src/lib.rs would fail to build if
+# listed as a member).
+#
+# janus-sched (M2) depends on the sibling `dtact` checkout at
+# D:\dev\janus-dev\dtact via a path dependency (see crates/janus-sched/
+# Cargo.toml) — that path is outside this workspace's own directory tree, so
+# `cargo build`/`cargo test` run from THIS workspace root will only succeed
+# if that sibling checkout is present at build time (it is, per the task's
+# environment description, but note it could not be `cargo build`-verified
+# in the sandbox this was authored in: only its `src/` tree was mounted, not
+# its own Cargo.toml, so its own crate metadata/edition/deps could not be
+# read to confirm compatibility — see the top-level report for details).
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Approved whitelist (see ENGINEERING_SPEC.md §0):
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "2"
+memmap2 = "0.9"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+faer = "0.19"
+# iced / wgpu / dtact are NOT pulled in for M1 (no UI/viz crates yet; the
+# pure-wave single-threaded kinetic solver does not need dtact scheduling).
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
