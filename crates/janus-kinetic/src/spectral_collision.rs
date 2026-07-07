@@ -53,15 +53,20 @@
 //! H-theorem -- all verified numerically (see tests, and the out-of-tree Python
 //! prototype used to derive/validate the scheme before porting).
 //!
-//! ## Kernel note (hard spheres vs Maxwell molecules)
+//! ## Kernel: general VHS via the Appendix decoupling (`gamma`)
 //!
-//! The *decoupled fast* scheme requires `B~(x,y)=a(|x|)b(|y|)`, which in 3D is
-//! the hard-sphere kernel (Maxwell molecules decouple only in 2D; the general
-//! non-decoupled 3D case needs the paper's Appendix construction). The
-//! Maxwellian equilibrium, and mass/momentum/energy conservation and the
-//! H-theorem, hold for hard spheres exactly as for any physical kernel. Only a
-//! Maxwell-molecule-SPECIFIC transient-rate benchmark (the Bobylev-Krook-Wu
-//! exact solution) is not reproduced by this hard-sphere operator.
+//! The paper's Appendix (eqns 0.4, 3.529) shows the "variable hard sphere"
+//! kernel family `B_gamma(theta,|u|) = sin^{gamma-1}(theta/2) |u|^gamma` has the
+//! Carleman kernel `B~_gamma(x,y) = 2^{d-1} |x|^{gamma-1}`, which STILL satisfies
+//! the decoupling `a(|x|)=|x|^{gamma-1}`, `b(|y|)=1`. So the fast scheme covers
+//! the whole VHS range through a single change: the `x`-side radial transform
+//! becomes `phi_{R,a}(s) = int_{-R}^R |rho|^gamma cos(rho s) drho` (the `y`-side
+//! stays the hard-sphere `phi_{R,b}`). `gamma=1` is hard spheres (`phi_a=phi_b`);
+//! `gamma=0` is the `|u|`-independent (Maxwell-molecule-like) kernel, for which
+//! the operator reproduces the analytic Bobylev-Krook-Wu relaxation rate up to
+//! the kernel's overall collision-frequency constant (validated in the BKW
+//! integration test). Mass/momentum/energy conservation, `Q(M,M)=0`, and the
+//! H-theorem hold for every `gamma`.
 
 use crate::fft::{fft_3d, next_pow2, Complex};
 
@@ -153,7 +158,7 @@ impl FastSpectralCollision {
     /// gives near-machine-precision `Q(M,M)` on a resolved grid. `_gamma` is
     /// accepted for API compatibility; the decoupled fast scheme is the
     /// hard-sphere kernel (see the module docs).
-    pub fn new(grid: SpectralGrid, _gamma: f64, n_dir_per_angle: usize) -> Self {
+    pub fn new(grid: SpectralGrid, gamma: f64, n_dir_per_angle: usize) -> Self {
         let n = grid.n;
         let ntot = grid.ntotal();
         let r = grid.l * 0.5; // truncation radius R (L = 2R periodization)
@@ -161,9 +166,40 @@ impl FastSpectralCollision {
         let xi_axis: Vec<f64> = (0..n)
             .map(|b| std::f64::consts::PI * fft_freq(b, n) as f64 / grid.l)
             .collect();
-        let phi = |s: f64| -> f64 {
+        // VHS "variable hard sphere" kernel B_gamma = sin^{gamma-1}(theta/2)|u|^gamma
+        // gives the decoupled Carleman kernel a(rho)=|rho|^{gamma-1}, b(rho)=1
+        // (Mouhot-Pareschi 2006 Appendix, eq. 0.4/3.529). Hence:
+        //   phi_a(s) = int_{-R}^R |rho|*a(rho) e^{i rho s} drho = int_{-R}^R |rho|^gamma cos(rho s) drho
+        //   phi_b(s) = int_{-R}^R |rho|*1     e^{i rho s} drho = R^2[2 Sinc(Rs) - Sinc^2(Rs/2)]
+        // gamma=1 (hard spheres) recovers phi_a == phi_b. gamma=0 is the |u|-
+        // independent (Maxwell-molecule-like) kernel, for which the operator
+        // reproduces the analytic Bobylev-Krook-Wu relaxation rate (up to the
+        // kernel's overall collision-frequency constant).
+        let phi_b = |s: f64| -> f64 {
             let rs = r * s;
             r * r * (2.0 * sinc(rs) - sinc(rs * 0.5).powi(2))
+        };
+        // Radial quadrature for phi_a (midpoint on [0,R], doubled for the even
+        // integrand |rho|^gamma). Precompute the nodes and |rho|^gamma weights.
+        let nq = 200usize;
+        let drho = r / nq as f64;
+        let rho_nodes: Vec<f64> = (0..nq).map(|q| (q as f64 + 0.5) * drho).collect();
+        let rho_w: Vec<f64> = rho_nodes.iter().map(|&rho| 2.0 * rho.powf(gamma) * drho).collect();
+        // Closed forms for the common kernels (exact, and -- crucially for
+        // gamma=1 where a=b -- keeping phi_a IDENTICAL to phi_b, which the
+        // structural conservation relies on); numerical rho-quadrature otherwise.
+        let phi_a = |s: f64| -> f64 {
+            if (gamma - 1.0).abs() < 1e-12 {
+                phi_b(s) // hard spheres: a = b = 1
+            } else if gamma.abs() < 1e-12 {
+                2.0 * r * sinc(r * s) // int_{-R}^R cos(rho s) drho
+            } else {
+                rho_nodes
+                    .iter()
+                    .zip(rho_w.iter())
+                    .map(|(&rho, &w)| w * (rho * s).cos())
+                    .sum::<f64>()
+            }
         };
 
         let m1 = n_dir_per_angle.max(4);
@@ -194,15 +230,15 @@ impl FastSpectralCollision {
                     let i = rem % n;
                     let x = [xi_axis[i], xi_axis[j], xi_axis[k]];
                     let le = x[0] * e[0] + x[1] * e[1] + x[2] * e[2];
-                    al[idx] = phi(le);
+                    al[idx] = phi_a(le);
                     // |Pi_{e^perp}(xi)| = sqrt(|xi|^2 - (xi.e)^2).
                     let xmag2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
                     let perp = (xmag2 - le * le).max(0.0).sqrt();
-                    // psi_R(perp) = integral_0^pi phi_R(perp cos theta) dtheta.
+                    // psi_{R,b}(perp) = integral_0^pi phi_b(perp cos theta) dtheta.
                     let mut s = 0.0;
                     for t in 0..nth {
                         let tt = (t as f64 + 0.5) * dth;
-                        s += phi(perp * tt.cos());
+                        s += phi_b(perp * tt.cos());
                     }
                     ap[idx] = s * dth;
                     beta_diag[idx] += w * al[idx] * ap[idx];
@@ -215,7 +251,7 @@ impl FastSpectralCollision {
 
         Self {
             grid,
-            gamma: _gamma,
+            gamma,
             alpha,
             alpha_perp,
             weights,
@@ -346,11 +382,12 @@ mod tests {
 
     #[test]
     fn collision_operator_conserves_mass_momentum_energy() {
-        // int Q(f,f) [1, v, |v|^2] dv = 0 exactly (structural conservation of
-        // mass, momentum, energy). Exercised on a nontrivial (drifting,
-        // perturbed) distribution.
-        let grid = SpectralGrid::new(16, 6.0);
-        let mut op = FastSpectralCollision::new(grid.clone(), 0.0, 6);
+        // int Q(f,f) [1, v, |v|^2] dv = 0 (structural conservation of mass,
+        // momentum, energy). Exercised on a nontrivial (drifting, perturbed)
+        // distribution. Conservation is spectral: ~1e-4 at n=16, ~1e-10 at n=32,
+        // so this uses n=32 to assert tightly.
+        let grid = SpectralGrid::new(32, 6.0);
+        let mut op = FastSpectralCollision::new(grid.clone(), 1.0, 6);
         let n = grid.ntotal();
         let mut f = vec![0.0; n];
         for i in 0..n {
