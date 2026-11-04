@@ -80,6 +80,7 @@ fn vdotn(v: [f64; 2], n: [f64; 2]) -> f64 {
 pub struct DiffuseWall {
     pub temperature: f64,
     pub wall_velocity: [f64; 2],
+    pub accommodation: f64,
 }
 
 impl BoundaryCondition for DiffuseWall {
@@ -107,12 +108,20 @@ impl BoundaryCondition for DiffuseWall {
         }
         // outflux (positive, mass/time leaving) must equal magnitude of
         // incoming flux: outflux = -rho_w * influx_unit  =>  rho_w = outflux / (-influx_unit)
-        let rho_w = if influx_unit.abs() > 1e-300 { outflux / (-influx_unit) } else { 0.0 };
+        let rho_w = if influx_unit.abs() > 1e-300 {
+            outflux / (-influx_unit)
+        } else {
+            0.0
+        };
 
         for (k, v) in vgrid.iter().enumerate() {
             let vn = vdotn(*v, normal);
             f_ghost[k] = if vn < 0.0 {
-                maxwellian_2d(rho_w, self.wall_velocity, self.temperature, r_gas, *v)
+                let diff = maxwellian_2d(rho_w, self.wall_velocity, self.temperature, r_gas, *v);
+                let vr = [v[0] - 2.0 * vn * normal[0], v[1] - 2.0 * vn * normal[1]];
+                let idx = nearest_velocity_index(vgrid, vr);
+                let spec = f_interior[idx];
+                self.accommodation * diff + (1.0 - self.accommodation) * spec
             } else {
                 // Outgoing directions: ghost mirrors interior (won't be used
                 // by upwind reconstruction, but kept consistent/nonzero).
@@ -132,24 +141,35 @@ impl BoundaryCondition for DiffuseWall {
         g_ghost: &mut [f64],
         h_ghost: &mut [f64],
     ) {
-        // Same rho_w mass-flux-balance solve as `apply`, reused so g_ghost
-        // matches exactly; h_ghost is the consistent (K/2)*R*T_wall*g_ghost
-        // Maxwellian companion for incoming directions (the wall re-emits a
-        // full local equilibrium, so both g and h reset to the wall
-        // Maxwellian pair), and mirrors h_interior for outgoing directions.
         self.apply(g_interior, vgrid, vw, normal, r_gas, g_ghost);
+
+        let mut outflux = 0.0;
+        let mut influx_unit = 0.0;
+        for (k, v) in vgrid.iter().enumerate() {
+            let vn = vdotn(*v, normal);
+            if vn > 0.0 {
+                outflux += vw[k] * g_interior[k] * vn;
+            } else if vn < 0.0 {
+                let m_unit = maxwellian_2d(1.0, self.wall_velocity, self.temperature, r_gas, *v);
+                influx_unit += vw[k] * m_unit * vn;
+            }
+        }
+        let rho_w = if influx_unit.abs() > 1e-300 {
+            outflux / (-influx_unit)
+        } else {
+            0.0
+        };
+
         for (k, v) in vgrid.iter().enumerate() {
             let vn = vdotn(*v, normal);
             if vn < 0.0 {
-                let (_, h_eq) = gh_equilibrium(1.0, self.wall_velocity, self.temperature, r_gas, *v);
-                // g_ghost[k] already carries rho_w baked in (maxwellian_2d
-                // scales linearly with rho), so scale h similarly: h for
-                // density rho_w is rho_w * (unit-density h), and g_ghost[k]
-                // / (unit-density g at rho=1) = rho_w. Simpler: recompute
-                // directly from rho_w by re-deriving it via g_ghost/g_unit.
-                let g_unit = maxwellian_2d(1.0, self.wall_velocity, self.temperature, r_gas, *v);
-                let rho_w = if g_unit.abs() > 1e-300 { g_ghost[k] / g_unit } else { 0.0 };
-                h_ghost[k] = rho_w * (h_eq); // h_eq already computed at rho=1
+                let (_, h_eq) =
+                    gh_equilibrium(1.0, self.wall_velocity, self.temperature, r_gas, *v);
+                let diff_h = rho_w * h_eq;
+                let vr = [v[0] - 2.0 * vn * normal[0], v[1] - 2.0 * vn * normal[1]];
+                let idx = nearest_velocity_index(vgrid, vr);
+                let spec_h = h_interior[idx];
+                h_ghost[k] = self.accommodation * diff_h + (1.0 - self.accommodation) * spec_h;
             } else {
                 h_ghost[k] = h_interior[k];
             }
@@ -341,10 +361,21 @@ impl BoundaryCondition for Symmetry {
 /// per-face-per-step hot loop (`DugksSolver::compute_boundary_face_flux`).
 #[derive(Clone, Copy, Debug)]
 pub enum BoundaryConditionKernel {
-    DiffuseWall { temperature: f64, wall_velocity: [f64; 2] },
+    DiffuseWall {
+        temperature: f64,
+        wall_velocity: [f64; 2],
+        accommodation: f64,
+    },
     SpecularWall,
-    VelocityInlet { velocity: [f64; 2], density: f64, temperature: f64 },
-    PressureInlet { pressure: f64, temperature: f64 },
+    VelocityInlet {
+        velocity: [f64; 2],
+        density: f64,
+        temperature: f64,
+    },
+    PressureInlet {
+        pressure: f64,
+        temperature: f64,
+    },
     Outlet,
     Symmetry,
     /// Periodic is handled structurally by the solver (wraps the cell
@@ -361,16 +392,32 @@ impl BoundaryConditionKernel {
     #[inline]
     pub fn from_kind(kind: &BoundaryKind) -> Self {
         match *kind {
-            BoundaryKind::DiffuseWall { temperature, wall_velocity } => {
-                Self::DiffuseWall { temperature, wall_velocity }
-            }
+            BoundaryKind::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            } => Self::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            },
             BoundaryKind::SpecularWall => Self::SpecularWall,
-            BoundaryKind::VelocityInlet { velocity, density, temperature } => {
-                Self::VelocityInlet { velocity, density, temperature }
-            }
-            BoundaryKind::PressureInlet { pressure, temperature } => {
-                Self::PressureInlet { pressure, temperature }
-            }
+            BoundaryKind::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            } => Self::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            },
+            BoundaryKind::PressureInlet {
+                pressure,
+                temperature,
+            } => Self::PressureInlet {
+                pressure,
+                temperature,
+            },
             BoundaryKind::Outlet => Self::Outlet,
             BoundaryKind::Symmetry => Self::Symmetry,
             BoundaryKind::Periodic => Self::Periodic,
@@ -388,16 +435,35 @@ impl BoundaryConditionKernel {
         f_ghost: &mut [f64],
     ) {
         match *self {
-            Self::DiffuseWall { temperature, wall_velocity } => {
-                DiffuseWall { temperature, wall_velocity }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            Self::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            } => DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
             }
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::SpecularWall => SpecularWall.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
-            Self::VelocityInlet { velocity, density, temperature } => {
-                VelocityInlet { velocity, density, temperature }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            Self::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            } => VelocityInlet {
+                velocity,
+                density,
+                temperature,
             }
-            Self::PressureInlet { pressure, temperature } => {
-                PressureInlet { pressure, temperature }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
+            Self::PressureInlet {
+                pressure,
+                temperature,
+            } => PressureInlet {
+                pressure,
+                temperature,
             }
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Outlet => Outlet.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Symmetry => Symmetry.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Periodic => Outlet.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
@@ -418,18 +484,52 @@ impl BoundaryConditionKernel {
         h_ghost: &mut [f64],
     ) {
         match *self {
-            Self::DiffuseWall { temperature, wall_velocity } => DiffuseWall { temperature, wall_velocity }
-                .apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
-            Self::SpecularWall => {
-                SpecularWall.apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost)
+            Self::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            } => DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
             }
-            Self::VelocityInlet { velocity, density, temperature } => VelocityInlet { velocity, density, temperature }
-                .apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
-            Self::PressureInlet { pressure, temperature } => PressureInlet { pressure, temperature }
-                .apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
-            Self::Outlet => Outlet.apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
-            Self::Symmetry => Symmetry.apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
-            Self::Periodic => Outlet.apply_gh(g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost),
+            .apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::SpecularWall => SpecularWall.apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            } => VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            }
+            .apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::PressureInlet {
+                pressure,
+                temperature,
+            } => PressureInlet {
+                pressure,
+                temperature,
+            }
+            .apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::Outlet => Outlet.apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::Symmetry => Symmetry.apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
+            Self::Periodic => Outlet.apply_gh(
+                g_interior, h_interior, vgrid, vw, normal, r_gas, g_ghost, h_ghost,
+            ),
         }
     }
 }
@@ -445,16 +545,32 @@ impl BoundaryConditionKernel {
 /// a silent reintroduction of `Box<dyn>` in a hot loop.
 pub fn from_kind(kind: &BoundaryKind) -> Box<dyn BoundaryCondition + Send + Sync> {
     match *kind {
-        BoundaryKind::DiffuseWall { temperature, wall_velocity } => {
-            Box::new(DiffuseWall { temperature, wall_velocity })
-        }
+        BoundaryKind::DiffuseWall {
+            temperature,
+            wall_velocity,
+            accommodation,
+        } => Box::new(DiffuseWall {
+            temperature,
+            wall_velocity,
+            accommodation,
+        }),
         BoundaryKind::SpecularWall => Box::new(SpecularWall),
-        BoundaryKind::VelocityInlet { velocity, density, temperature } => {
-            Box::new(VelocityInlet { velocity, density, temperature })
-        }
-        BoundaryKind::PressureInlet { pressure, temperature } => {
-            Box::new(PressureInlet { pressure, temperature })
-        }
+        BoundaryKind::VelocityInlet {
+            velocity,
+            density,
+            temperature,
+        } => Box::new(VelocityInlet {
+            velocity,
+            density,
+            temperature,
+        }),
+        BoundaryKind::PressureInlet {
+            pressure,
+            temperature,
+        } => Box::new(PressureInlet {
+            pressure,
+            temperature,
+        }),
         BoundaryKind::Outlet => Box::new(Outlet),
         BoundaryKind::Symmetry => Box::new(Symmetry),
         BoundaryKind::Periodic => {
@@ -484,7 +600,11 @@ mod tests {
         for (k, v) in vgrid.iter().enumerate() {
             f_interior[k] = maxwellian_2d(rho, u, t, r_gas, *v);
         }
-        let wall = DiffuseWall { temperature: t, wall_velocity: [0.0, 0.0] };
+        let wall = DiffuseWall {
+            temperature: t,
+            wall_velocity: [0.0, 0.0],
+            accommodation: 1.0,
+        };
         let normal = [1.0, 0.0];
         let mut f_ghost = vec![0.0; vgrid.len()];
         wall.apply(&f_interior, &vgrid, &vw, normal, r_gas, &mut f_ghost);
@@ -500,7 +620,10 @@ mod tests {
                 net += vw[k] * f_ghost[k] * vn;
             }
         }
-        assert!(net.abs() < 1e-6, "net mass flux at diffuse wall should vanish, got {net}");
+        assert!(
+            net.abs() < 1e-6,
+            "net mass flux at diffuse wall should vanish, got {net}"
+        );
     }
 
     #[test]
@@ -529,6 +652,9 @@ mod tests {
                 net += vw[k] * f_ghost[k] * vn;
             }
         }
-        assert!(net.abs() < 1e-2 * rho * u[0].abs().max(1.0), "net flux {net}");
+        assert!(
+            net.abs() < 1e-2 * rho * u[0].abs().max(1.0),
+            "net flux {net}"
+        );
     }
 }

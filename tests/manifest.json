@@ -1,0 +1,33 @@
+{
+  "case_name": "test",
+  "write_every": 50,
+  "dims": [
+    20,
+    20,
+    1
+  ],
+  "spacing": [
+    5e-05,
+    5e-05,
+    1.0
+  ],
+  "origin": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "frames": [
+    {
+      "index": 0,
+      "step": 0,
+      "time": 0.0,
+      "file": "example_0000.jvtk"
+    },
+    {
+      "index": 1,
+      "step": 50,
+      "time": 3.928371006591931e-07,
+      "file": "example_0001.jvtk"
+    }
+  ]
+}

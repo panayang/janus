@@ -47,7 +47,10 @@ pub struct HaloBuffer3D {
 
 impl HaloBuffer3D {
     pub fn zeros(len: usize) -> Self {
-        Self { current: vec![0.0; len], next: vec![0.0; len] }
+        Self {
+            current: vec![0.0; len],
+            next: vec![0.0; len],
+        }
     }
 
     /// Swap `next` into `current` (O(1), no allocation) at the end of a
@@ -118,7 +121,9 @@ impl SchedRunner3D {
         let blocks = crate::block3d::partition_grid_3d(&grid, blocks_x, blocks_y, blocks_z);
         let halos = blocks.iter().map(BlockHalo3D::for_block).collect();
         let accumulators = vec![PaddedAccumulator3D::new(); blocks.len()];
-        let result_slots = (0..blocks.len()).map(|_| Box::new(AtomicU64::new(0))).collect();
+        let result_slots = (0..blocks.len())
+            .map(|_| Box::new(AtomicU64::new(0)))
+            .collect();
         Self {
             grid,
             blocks,
@@ -137,6 +142,49 @@ impl SchedRunner3D {
         for core in 0..n_cores_hint {
             dtact::set_deflection_threshold(core, self.deflection_threshold);
         }
+    }
+
+    /// Apply a simple halo-aware stencil update to a block-local 3D state
+    /// array. Ghost values are read from the current halo buffers at the
+    /// block faces, and the returned sample can be published to adjacent
+    /// blocks for the next exchange round.
+    pub fn halo_aware_block_update_3d(
+        &self,
+        block: &Block3D,
+        halo: &BlockHalo3D,
+        state: &[f64],
+    ) -> (Vec<f64>, HaloBuffer3D) {
+        let width = block.i1 - block.i0;
+        let height = block.j1 - block.j0;
+        let depth = block.k1 - block.k0;
+        assert_eq!(state.len(), width * height * depth);
+
+        let mut updated = Vec::with_capacity(state.len());
+        for k in 0..depth {
+            for j in 0..height {
+                for i in 0..width {
+                    let idx = (k * height + j) * width + i;
+                    let current = state[idx];
+                    let west_val = if i > 0 { state[idx - 1] } else { halo.west.current.get(k * height + j).copied().unwrap_or_default() };
+                    let east_val = if i + 1 < width { state[idx + 1] } else { halo.east.current.get(k * height + j).copied().unwrap_or_default() };
+                    let south_val = if j > 0 { state[idx - width] } else { halo.south.current.get(k * width + i).copied().unwrap_or_default() };
+                    let north_val = if j + 1 < height { state[idx + width] } else { halo.north.current.get(k * width + i).copied().unwrap_or_default() };
+                    let down_val = if k > 0 { state[idx - width * height] } else { halo.down.current.get(j * width + i).copied().unwrap_or_default() };
+                    let up_val = if k + 1 < depth { state[idx + width * height] } else { halo.up.current.get(j * width + i).copied().unwrap_or_default() };
+                    let next_value = current + 0.125 * (west_val + east_val + south_val + north_val + down_val + up_val - 6.0 * current);
+                    updated.push(next_value);
+                }
+            }
+        }
+
+        let halo_values = updated.clone();
+        (
+            updated,
+            HaloBuffer3D {
+                current: halo_values.clone(),
+                next: halo_values,
+            },
+        )
     }
 
     /// Advance every block one step, each on its own dtact fiber, using
@@ -162,18 +210,6 @@ impl SchedRunner3D {
             let kind = block.classify(self.particle_density_threshold);
             let block_copy = *block;
             self.result_slots[bi].store(0, Ordering::Relaxed);
-            // SAFETY: `counter` is a raw pointer to the `AtomicU64` owned by
-            // `self.result_slots[bi]`'s `Box` (a stable heap allocation that
-            // outlives this whole function call — `self` is not dropped or
-            // moved while any spawned fiber below might still be running,
-            // since we unconditionally `dtact_await` every handle before
-            // this function returns). We reborrow it as `&'static AtomicU64`
-            // only for the duration of the spawned future, which is
-            // guaranteed to finish (and stop touching the pointer) before
-            // the join loop below completes and this function returns —
-            // satisfying the aliasing/lifetime contract despite the
-            // `'static` cast, which is otherwise unchecked by the compiler.
-            // Identical reasoning to `runner::SchedRunner::step_all_blocks`.
             let counter: &'static AtomicU64 =
                 unsafe { &*(self.result_slots[bi].as_ref() as *const AtomicU64) };
             let handle = match kind {
@@ -225,6 +261,16 @@ impl SchedRunner3D {
             halo.up.swap();
         }
     }
+
+    /// Retrieve the telemetry cost results stored by the fibers during the last
+    /// call to `step_all_blocks`. Identical contract to
+    /// `runner::SchedRunner::collect_block_costs`.
+    pub fn collect_block_costs(&self) -> Vec<u64> {
+        self.result_slots
+            .iter()
+            .map(|slot| slot.load(Ordering::Acquire))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -262,5 +308,24 @@ mod tests {
         assert_eq!(halo.north.current.len(), 6 * 2);
         assert_eq!(halo.down.current.len(), 6 * 4);
         assert_eq!(halo.up.current.len(), 6 * 4);
+    }
+
+    #[test]
+    fn halo_aware_block_update_uses_neighbor_face_values_3d() {
+        let grid = Grid3D::new(1, 1, 1, 1.0, 1.0, 1.0, [0.0, 0.0, 0.0]);
+        let runner = SchedRunner3D::new(grid, 1, 1, 1);
+        let block = runner.blocks[0];
+        let mut halo = BlockHalo3D::for_block(&block);
+        halo.west.current[0] = 2.0;
+        halo.east.current[0] = 3.0;
+        halo.south.current[0] = 1.0;
+        halo.north.current[0] = 4.0;
+        halo.down.current[0] = 0.5;
+        halo.up.current[0] = 1.5;
+
+        let state = vec![1.0; block.ncells()];
+        let (updated, _) = runner.halo_aware_block_update_3d(&block, &halo, &state);
+        let expected = 1.0 + 0.125 * (2.0 + 3.0 + 1.0 + 4.0 + 0.5 + 1.5 - 6.0 * 1.0);
+        assert_eq!(updated[0], expected);
     }
 }

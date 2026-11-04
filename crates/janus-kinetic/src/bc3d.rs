@@ -31,12 +31,13 @@ pub trait BoundaryCondition3D {
     );
 }
 
-/// Fully diffuse wall (Maxwell full accommodation), 3D: identical
+/// Fully diffuse wall (Maxwell mixed accommodation), 3D: identical
 /// mass-flux-balance construction to the 2D `bc::DiffuseWall`, generalized
 /// to a 3-component velocity/normal.
 pub struct DiffuseWall3D {
     pub temperature: f64,
     pub wall_velocity: [f64; 3],
+    pub accommodation: f64,
 }
 
 impl BoundaryCondition3D for DiffuseWall3D {
@@ -60,14 +61,27 @@ impl BoundaryCondition3D for DiffuseWall3D {
                 influx_unit += vw[k] * m_unit * vn;
             }
         }
-        let rho_w = if influx_unit.abs() > 1e-300 { outflux / (-influx_unit) } else { 0.0 };
+        let rho_w = if influx_unit.abs() > 1e-300 {
+            outflux / (-influx_unit)
+        } else {
+            0.0
+        };
 
         for (k, v) in vgrid.iter().enumerate() {
             let vn = vdotn(*v, normal);
             f_ghost[k] = if vn < 0.0 {
-                maxwellian_3d(rho_w, self.wall_velocity, self.temperature, r_gas, *v)
+                let diff = maxwellian_3d(rho_w, self.wall_velocity, self.temperature, r_gas, *v);
+                let vr = [
+                    v[0] - 2.0 * vn * normal[0],
+                    v[1] - 2.0 * vn * normal[1],
+                    v[2] - 2.0 * vn * normal[2],
+                ];
+                let idx = nearest_velocity_index(vgrid, vr);
+                let spec = f_interior[idx];
+                self.accommodation * diff + (1.0 - self.accommodation) * spec
             } else {
-                f_interior[k]
+                f_ghost[k] = f_interior[k];
+                f_ghost[k]
             };
         }
     }
@@ -206,10 +220,21 @@ impl BoundaryCondition3D for Symmetry3D {
 /// as `bc::BoundaryConditionKernel`), one variant per `BoundaryKind3D`.
 #[derive(Clone, Copy, Debug)]
 pub enum BoundaryConditionKernel3D {
-    DiffuseWall { temperature: f64, wall_velocity: [f64; 3] },
+    DiffuseWall {
+        temperature: f64,
+        wall_velocity: [f64; 3],
+        accommodation: f64,
+    },
     SpecularWall,
-    VelocityInlet { velocity: [f64; 3], density: f64, temperature: f64 },
-    PressureInlet { pressure: f64, temperature: f64 },
+    VelocityInlet {
+        velocity: [f64; 3],
+        density: f64,
+        temperature: f64,
+    },
+    PressureInlet {
+        pressure: f64,
+        temperature: f64,
+    },
     Outlet,
     Symmetry,
     /// Never actually invoked (handled structurally by the solver, wraps
@@ -221,14 +246,32 @@ impl BoundaryConditionKernel3D {
     #[inline]
     pub fn from_kind(kind: &BoundaryKind3D) -> Self {
         match *kind {
-            BoundaryKind3D::DiffuseWall { temperature, wall_velocity } => {
-                Self::DiffuseWall { temperature, wall_velocity }
-            }
+            BoundaryKind3D::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            } => Self::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            },
             BoundaryKind3D::SpecularWall => Self::SpecularWall,
-            BoundaryKind3D::VelocityInlet { velocity, density, temperature } => {
-                Self::VelocityInlet { velocity, density, temperature }
-            }
-            BoundaryKind3D::PressureInlet { pressure, temperature } => Self::PressureInlet { pressure, temperature },
+            BoundaryKind3D::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            } => Self::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            },
+            BoundaryKind3D::PressureInlet {
+                pressure,
+                temperature,
+            } => Self::PressureInlet {
+                pressure,
+                temperature,
+            },
             BoundaryKind3D::Outlet => Self::Outlet,
             BoundaryKind3D::Symmetry => Self::Symmetry,
             BoundaryKind3D::Periodic => Self::Periodic,
@@ -246,16 +289,37 @@ impl BoundaryConditionKernel3D {
         f_ghost: &mut [f64],
     ) {
         match *self {
-            Self::DiffuseWall { temperature, wall_velocity } => {
-                DiffuseWall3D { temperature, wall_velocity }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            Self::DiffuseWall {
+                temperature,
+                wall_velocity,
+                accommodation,
+            } => DiffuseWall3D {
+                temperature,
+                wall_velocity,
+                accommodation,
             }
-            Self::SpecularWall => SpecularWall3D.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
-            Self::VelocityInlet { velocity, density, temperature } => {
-                VelocityInlet3D { velocity, density, temperature }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
+            Self::SpecularWall => {
+                SpecularWall3D.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
             }
-            Self::PressureInlet { pressure, temperature } => {
-                PressureInlet3D { pressure, temperature }.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost)
+            Self::VelocityInlet {
+                velocity,
+                density,
+                temperature,
+            } => VelocityInlet3D {
+                velocity,
+                density,
+                temperature,
             }
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
+            Self::PressureInlet {
+                pressure,
+                temperature,
+            } => PressureInlet3D {
+                pressure,
+                temperature,
+            }
+            .apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Outlet => Outlet3D.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Symmetry => Symmetry3D.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
             Self::Periodic => Outlet3D.apply(f_interior, vgrid, vw, normal, r_gas, f_ghost),
@@ -279,7 +343,11 @@ mod tests {
         for (k, v) in vgrid.iter().enumerate() {
             f_interior[k] = maxwellian_3d(rho, u, t, r_gas, *v);
         }
-        let wall = DiffuseWall3D { temperature: t, wall_velocity: [0.0, 0.0, 0.0] };
+        let wall = DiffuseWall3D {
+            temperature: t,
+            wall_velocity: [0.0, 0.0, 0.0],
+            accommodation: 1.0,
+        };
         let normal = [1.0, 0.0, 0.0];
         let mut f_ghost = vec![0.0; vgrid.len()];
         wall.apply(&f_interior, &vgrid, &vw, normal, r_gas, &mut f_ghost);
@@ -293,7 +361,10 @@ mod tests {
                 net += vw[k] * f_ghost[k] * vn;
             }
         }
-        assert!(net.abs() < 1e-3, "net mass flux at 3D diffuse wall should vanish, got {net}");
+        assert!(
+            net.abs() < 1e-3,
+            "net mass flux at 3D diffuse wall should vanish, got {net}"
+        );
     }
 
     #[test]
@@ -330,6 +401,9 @@ mod tests {
                 net += vw[k] * f_ghost[k] * vn;
             }
         }
-        assert!(net.abs() < 1e-1 * rho * u[0].abs().max(1.0), "net flux {net}");
+        assert!(
+            net.abs() < 1e-1 * rho * u[0].abs().max(1.0),
+            "net flux {net}"
+        );
     }
 }
